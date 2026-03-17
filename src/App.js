@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, memo } from "react";
+import { useState, useEffect, useRef, useCallback, memo, useMemo } from "react";
 
 const GFONT = "https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap";
 const M = "'Share Tech Mono','Courier New',monospace";
@@ -19,19 +19,30 @@ function scoreColor(s){return s>65?P.green:s>40?P.amber:P.red;}
 const POOL="!@#$%^&*01X+=-:;.,?abcdefghijklmnopqrstuvwxyz0123456789";
 function hexRgb(h){const x=h.replace("#","");return[parseInt(x.slice(0,2),16)||0,parseInt(x.slice(2,4),16)||0,parseInt(x.slice(4,6),16)||0];}
 
-// ── SECURITY ──────────────────────────────────────────────────────────────────
-function isValidUrl(raw){try{const u=new URL(raw.trim());return u.protocol==="http:"||u.protocol==="https:";}catch(e){return false;}}
-function safeHref(raw){try{const u=new URL(raw);if(u.protocol!=="http:"&&u.protocol!=="https:")return"#";return raw;}catch(e){return"#";}}
-function classifyError(e){const m=e.message||"";if(m.indexOf("HTTP 4")!==-1)return"API key or quota issue.";if(m.indexOf("HTTP 5")!==-1)return"Server error. Try again.";if(m.indexOf("No JSON")!==-1)return"Analysis returned no data. Try again.";if(m.indexOf("fetch")!==-1||m.indexOf("network")!==-1)return"Network error. Check connection.";return"Error: "+m.slice(0,80);}
+// ── SHARED RAF TICKER ────────────────────────────────────────────────────────
+// Single global RAF loop — all neon animations subscribe here instead of
+// each running their own requestAnimationFrame.
+const rafSubs = new Set();
+let rafId = null;
+function rafTick() {
+  rafSubs.forEach(fn => fn());
+  rafId = rafSubs.size > 0 ? requestAnimationFrame(rafTick) : null;
+}
+function subRaf(fn) {
+  rafSubs.add(fn);
+  if (!rafId) rafId = requestAnimationFrame(rafTick);
+  return () => { rafSubs.delete(fn); };
+}
+
+// ── SECURITY ─────────────────────────────────────────────────────────────────
+function isValidUrl(raw){try{const u=new URL(raw.trim());return u.protocol==="http:"||u.protocol==="https:";}catch{return false;}}
+function safeHref(raw){try{const u=new URL(raw);return(u.protocol==="http:"||u.protocol==="https:")?raw:"#";}catch{return"#";}}
+function classifyError(e){const m=e.message||"";if(m.includes("aborted")||m.includes("abort"))return"Scan cancelled.";if(m.includes("HTTP 4"))return"API key or quota issue.";if(m.includes("HTTP 5"))return"Server error. Try again.";if(m.includes("No JSON"))return"Analysis returned no data. Try again.";if(m.includes("fetch")||m.includes("network"))return"Network error. Check connection.";return"Error: "+m.slice(0,80);}
 
 // ── URL CACHE ─────────────────────────────────────────────────────────────────
 function urlCacheKey(url){return"urlcache:"+btoa(url.trim()).replace(/[^a-zA-Z0-9]/g,"_").slice(0,100);}
-async function getCached(url){
-  try{const r=await window.storage.get(urlCacheKey(url));if(!r)return null;return JSON.parse(r.value);}catch(e){return null;}
-}
-async function setCached(url,payload){
-  try{await window.storage.set(urlCacheKey(url),JSON.stringify({...payload,cachedAt:Date.now()}));}catch(e){}
-}
+async function getCached(url){try{const r=await window.storage.get(urlCacheKey(url));return r?JSON.parse(r.value):null;}catch{return null;}}
+async function setCached(url,payload){try{await window.storage.set(urlCacheKey(url),JSON.stringify({...payload,cachedAt:Date.now()}));}catch{}}
 
 // ── COMPRESSION ───────────────────────────────────────────────────────────────
 const F={domNew:1,domYoung:2,badActor:4,noGlobal:8,retracted:16,conflict:32,clickbait:64,highRhet:128};
@@ -41,9 +52,28 @@ function daysNow(){return Math.floor((Date.now()-EPOCH)/86400000);}
 function daysToDate(d){return new Date(EPOCH+d*86400000).toLocaleDateString();}
 function flagsToStrings(f){const out=[];if(f&F.domNew)out.push("Domain<90d");if(f&F.domYoung)out.push("Domain<1yr");if(f&F.badActor)out.push("Bad actor");if(f&F.noGlobal)out.push("No coverage");if(f&F.retracted)out.push("Retracted");if(f&F.conflict)out.push("Conflict");if(f&F.clickbait)out.push("Clickbait");if(f&F.highRhet)out.push("High rhetoric");return out;}
 
+// memoised so multiple consumers share one result per osint object
+const _osintCache = new WeakMap();
+function osintPreScore(osint){
+  if(!osint)return null;
+  if(_osintCache.has(osint))return _osintCache.get(osint);
+  let score=65;const flags=[];
+  if(osint.whois){if(osint.whois.ageDays<90){score-=30;flags.push("Domain<90 days");}else if(osint.whois.ageDays<365){score-=15;flags.push("Domain<1 year");}else if(osint.whois.ageDays>3650)score+=10;}
+  if(osint.openSources?.flagged){score-=35;flags.push("Known unreliable");}
+  if(osint.gdelt){if(osint.gdelt.count===0){score-=20;flags.push("No global coverage");}else if(osint.gdelt.count>5)score+=15;}
+  if(osint.scholar?.some(p=>p.retracted)){score-=25;flags.push("Retracted citation");}
+  if(osint.tone){const t=parseFloat(osint.tone.avgTone);if(t<-5){score-=10;flags.push("Negative sentiment");}if(t>5){score-=5;flags.push("Suspicious positivity");}}
+  if(osint.wayback){if(!osint.wayback.available){score-=8;flags.push("No archive record");}
+    if(osint.wayback.certAge&&osint.wayback.firstSeen){const cy=parseInt(osint.wayback.certAge);const ay=parseInt(osint.wayback.firstSeen);if(cy>ay+2){score-=12;flags.push("Cert newer than archive");}}}
+  if(osint.factChecks?.length>0){const neg=["false","mostly false","pants on fire","four pinocchios","misleading"];
+    if(osint.factChecks.some(c=>c.rating&&neg.some(n=>c.rating.toLowerCase().includes(n)))){score-=20;flags.push("Fact-checked as false");}}
+  const result={score:Math.max(0,Math.min(100,score)),flags};
+  _osintCache.set(osint,result);
+  return result;
+}
+
 function compress(r,url,osint,ci){
-  const vs=(r.politicalLeanings?.values)||[];
-  const ls=(r.politicalLeanings?.labels)||[];
+  const vs=(r.politicalLeanings?.values)||[];const ls=(r.politicalLeanings?.labels)||[];
   const mi=vs.indexOf(Math.max(...(vs.length?vs:[0])));
   const polIdx=Math.max(...(vs.length?vs:[0]))>20?POL_LABELS.indexOf(ls[mi]):3;
   let flags=0;
@@ -55,83 +85,14 @@ function compress(r,url,osint,ci){
   if(r.headline&&(r.headline.match==="CLICKBAIT"||r.headline.match==="MISLEADING"))flags|=F.clickbait;
   if(r.rhetoric?.some(x=>x.severity==="high"))flags|=F.highRhet;
   const pre=osint?osintPreScore(osint):null;
-  return{v:2,d:domainName(url),t:daysNow(),s:r.overallScore,os:pre?pre.score:null,p:polIdx>=0?polIdx:3,f:flags,
-    q:r.criteria?.factCheck?.score??null,h:r.headline?r.headline.score:null,
+  return{v:2,d:domainName(url),t:daysNow(),s:r.overallScore,os:pre?pre.score:null,
+    p:polIdx>=0?polIdx:3,f:flags,q:r.criteria?.factCheck?.score??null,h:r.headline?.score??null,
     ow:r.ownership?.chain?.[0]?.name.slice(0,24)??null,
     gd:osint?.gdelt?.count??null,wa:osint?.whois?.ageDays??null,
-    cs:(r.claims||[]).slice(0,5).map(c=>c.score),sum:r.summary?r.summary.slice(0,120):null,
+    cs:(r.claims||[]).slice(0,5).map(c=>c.score),sum:r.summary?.slice(0,120)??null,
     ci:ci?{lo:ci.low,hi:ci.high}:null};
 }
 
-// ── OSINT ─────────────────────────────────────────────────────────────────────
-function withTimeout(promise,ms){return Promise.race([promise,new Promise((_,reject)=>setTimeout(()=>reject(new Error("timeout")),ms))]);}
-
-async function queryGDELT(url){
-  try{const domain=new URL(url).hostname.replace("www.","");const q=encodeURIComponent('"'+domain+'"');
-  const r=await withTimeout(fetch("https://api.gdeltproject.org/api/v2/doc/doc?query="+q+"&mode=artlist&maxrecords=10&format=json"),6000);
-  if(!r.ok)return null;const d=await r.json();const articles=d.articles||[];
-  const sources=[];articles.forEach(a=>{if(!sources.includes(a.domain))sources.push(a.domain);});
-  return{count:articles.length,sources:sources.slice(0,5),raw:articles.slice(0,3)};}catch(e){return null;}
-}
-async function queryWHOIS(url){
-  try{const domain=new URL(url).hostname.replace("www.","");
-  const r=await withTimeout(fetch("https://www.whoisxmlapi.com/whoisserver/WhoisService?apiKey=at_demo&domainName="+domain+"&outputFormat=JSON"),5000);
-  if(!r.ok)return null;const d=await r.json();const wr=d.WhoisRecord||{};
-  const created=wr.createdDate||(wr.registryData&&wr.registryData.createdDate);if(!created)return null;
-  const ageDays=Math.floor((Date.now()-new Date(created).getTime())/86400000);
-  return{ageDays,ageYears:(ageDays/365).toFixed(1),created:created.slice(0,10),registrar:wr.registrarName||"Unknown"};}catch(e){return null;}
-}
-const KNOWN_BAD=new Set(["infowars.com","naturalnews.com","beforeitsnews.com","worldnewsdailyreport.com","empirenews.net","nationalreport.net","theonion.com","clickhole.com","babylonbee.com","zerohedge.com","globalresearch.ca","activistpost.com","21stcenturywire.com","thegatewaypundit.com","bigleaguepolitics.com","coreysdigs.com","veteranstoday.com"]);
-async function checkOpenSources(url){
-  try{const domain=new URL(url).hostname.replace("www.","");const base=domain.split(".").slice(-2).join(".");return{domain:base,flagged:KNOWN_BAD.has(domain)||KNOWN_BAD.has(base)};}catch(e){return null;}
-}
-async function checkSemanticScholar(query){
-  try{const r=await withTimeout(fetch("https://api.semanticscholar.org/graph/v1/paper/search?query="+encodeURIComponent(query.slice(0,200))+"&fields=title,year,citationCount,isRetracted,authors&limit=3"),6000);
-  if(!r.ok)return null;const d=await r.json();
-  return(d.data||[]).map(p=>({title:p.title,year:p.year,citations:p.citationCount,retracted:p.isRetracted,authors:(p.authors||[]).slice(0,2).map(a=>a.name).join(", ")}));}catch(e){return null;}
-}
-async function queryGDELTTone(keywords){
-  try{const r=await withTimeout(fetch("https://api.gdeltproject.org/api/v2/doc/doc?query="+encodeURIComponent(keywords.slice(0,100))+"&mode=tonechart&format=json"),5000);
-  if(!r.ok)return null;const d=await r.json();const bins=d.tonechart||[];if(!bins.length)return null;
-  const avg=bins.reduce((s,b)=>s+parseFloat(b.tonescore||0),0)/bins.length;return{avgTone:avg.toFixed(2)};}catch(e){return null;}
-}
-async function queryFactCheckTools(url){
-  try{const domain=new URL(url).hostname.replace("www.","");
-  const r=await withTimeout(fetch("https://factchecktools.googleapis.com/v1alpha1/claims:search?query="+encodeURIComponent(domain)+"&key=AIzaSyDemo_FactCheckAPI_NotReal"),4000);
-  if(!r.ok)return null;const d=await r.json();
-  return(d.claims||[]).slice(0,5).map(c=>{const rv=(c.claimReview&&c.claimReview[0])||{};return{claim:c.text,claimant:c.claimant,date:c.claimDate,publisher:rv.publisher?.name,rating:rv.textualRating,url:rv.url};});}catch(e){return null;}
-}
-async function queryWayback(url){
-  try{const encoded=encodeURIComponent(url);
-  const avail=await withTimeout(fetch("https://archive.org/wayback/available?url="+encoded),5000);
-  if(!avail.ok)return null;const ad=await avail.json();
-  const closest=ad.archived_snapshots?.closest;if(!closest?.available)return{available:false};
-  const snapTs=closest.timestamp;
-  const snapDate=snapTs.slice(0,4)+"-"+snapTs.slice(4,6)+"-"+snapTs.slice(6,8);
-  const snapUrl=closest.url;
-  let firstSeen=null;
-  try{const cdxR=await withTimeout(fetch("https://web.archive.org/cdx/search/cdx?url="+encoded+"&output=json&limit=1&fl=timestamp&from=20000101"),4000);
-  if(cdxR.ok){const cdx=await cdxR.json();if(cdx?.length>1){const ts=cdx[1][0];firstSeen=ts.slice(0,4)+"-"+ts.slice(4,6)+"-"+ts.slice(6,8);}}}catch(e){}
-  let certAge=null;
-  try{const domain=new URL(url).hostname.replace("www.","");
-  const crtR=await withTimeout(fetch("https://crt.sh/?q="+domain+"&output=json"),4000);
-  if(crtR.ok){const certs=await crtR.json();if(certs?.length){const earliest=certs.reduce((min,c)=>c.not_before<min?c.not_before:min,certs[0].not_before);certAge=earliest?earliest.slice(0,10):null;}}}catch(e){}
-  return{available:true,latestSnapshot:snapDate,latestUrl:snapUrl,firstSeen,certAge};}catch(e){return null;}
-}
-
-function osintPreScore(osint){
-  if(!osint)return null;let score=65;const flags=[];
-  if(osint.whois){if(osint.whois.ageDays<90){score-=30;flags.push("Domain<90 days");}else if(osint.whois.ageDays<365){score-=15;flags.push("Domain<1 year");}else if(osint.whois.ageDays>3650)score+=10;}
-  if(osint.openSources?.flagged){score-=35;flags.push("Known unreliable");}
-  if(osint.gdelt){if(osint.gdelt.count===0){score-=20;flags.push("No global coverage");}else if(osint.gdelt.count>5)score+=15;}
-  if(osint.scholar?.some(p=>p.retracted)){score-=25;flags.push("Retracted citation");}
-  if(osint.tone){const t=parseFloat(osint.tone.avgTone);if(t<-5){score-=10;flags.push("Negative sentiment");}if(t>5){score-=5;flags.push("Suspicious positivity");}}
-  if(osint.wayback){if(!osint.wayback.available){score-=8;flags.push("No archive record");}
-  if(osint.wayback.certAge&&osint.wayback.firstSeen){const cy=parseInt(osint.wayback.certAge.slice(0,4));const ay=parseInt(osint.wayback.firstSeen.slice(0,4));if(cy>ay+2){score-=12;flags.push("Cert newer than archive");}}}
-  if(osint.factChecks?.length>0){const neg=["false","mostly false","pants on fire","four pinocchios","misleading"];
-  if(osint.factChecks.some(c=>c.rating&&neg.some(n=>c.rating.toLowerCase().includes(n)))){score-=20;flags.push("Fact-checked as false");}}
-  return{score:Math.max(0,Math.min(100,score)),flags};
-}
 function computeConfidenceInterval(aiScore,osint){
   const pre=osintPreScore(osint);const signals=[aiScore];
   if(pre?.score!=null)signals.push(pre.score);
@@ -140,21 +101,102 @@ function computeConfidenceInterval(aiScore,osint){
   const avg=signals.reduce((s,v)=>s+v,0)/signals.length;
   const variance=signals.reduce((s,v)=>s+Math.pow(v-avg,2),0)/signals.length;
   const stdDev=Math.sqrt(variance);
-  const agreement=stdDev<10?"HIGH":stdDev<20?"MEDIUM":"LOW";
-  return{low:Math.max(0,Math.round(avg-stdDev)),high:Math.min(100,Math.round(avg+stdDev)),stdDev:Math.round(stdDev),agreement,signalCount:signals.length};
+  return{low:Math.max(0,Math.round(avg-stdDev)),high:Math.min(100,Math.round(avg+stdDev)),stdDev:Math.round(stdDev),agreement:stdDev<10?"HIGH":stdDev<20?"MEDIUM":"LOW",signalCount:signals.length};
 }
-async function runOSINT(url){
-  let domain="";try{domain=new URL(url).hostname.replace("www.","");}catch(e){}
-  const results=await Promise.all([queryGDELT(url),queryWHOIS(url),checkOpenSources(url),checkSemanticScholar(domain),queryGDELTTone(domain),queryFactCheckTools(url),queryWayback(url)]);
-  return{gdelt:results[0],whois:results[1],openSources:results[2],scholar:results[3],tone:results[4],factChecks:results[5],wayback:results[6]};
+
+// ── OSINT — each call isolated, abort-aware ────────────────────────────────
+function withTimeout(p,ms){return Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(new Error("timeout")),ms))]);}
+
+async function safeCall(fn){try{return await fn();}catch{return null;}}
+
+async function queryGDELT(url,sig){
+  return safeCall(async()=>{
+    const domain=new URL(url).hostname.replace("www.","");
+    const r=await withTimeout(fetch("https://api.gdeltproject.org/api/v2/doc/doc?query="+encodeURIComponent('"'+domain+'"')+"&mode=artlist&maxrecords=10&format=json",{signal:sig}),6000);
+    if(!r.ok)return null;const d=await r.json();const articles=d.articles||[];
+    const sources=[];articles.forEach(a=>{if(!sources.includes(a.domain))sources.push(a.domain);});
+    return{count:articles.length,sources:sources.slice(0,5),raw:articles.slice(0,3)};
+  });
+}
+async function queryWHOIS(url,sig){
+  return safeCall(async()=>{
+    const domain=new URL(url).hostname.replace("www.","");
+    const r=await withTimeout(fetch("https://www.whoisxmlapi.com/whoisserver/WhoisService?apiKey=at_demo&domainName="+domain+"&outputFormat=JSON",{signal:sig}),5000);
+    if(!r.ok)return null;const d=await r.json();const wr=d.WhoisRecord||{};
+    const created=wr.createdDate||(wr.registryData?.createdDate);if(!created)return null;
+    const ageDays=Math.floor((Date.now()-new Date(created).getTime())/86400000);
+    return{ageDays,ageYears:(ageDays/365).toFixed(1),created:created.slice(0,10),registrar:wr.registrarName||"Unknown"};
+  });
+}
+const KNOWN_BAD=new Set(["infowars.com","naturalnews.com","beforeitsnews.com","worldnewsdailyreport.com","empirenews.net","nationalreport.net","theonion.com","clickhole.com","babylonbee.com","zerohedge.com","globalresearch.ca","activistpost.com","21stcenturywire.com","thegatewaypundit.com","bigleaguepolitics.com","coreysdigs.com","veteranstoday.com"]);
+function checkOpenSources(url){
+  try{const domain=new URL(url).hostname.replace("www.","");const base=domain.split(".").slice(-2).join(".");return{domain:base,flagged:KNOWN_BAD.has(domain)||KNOWN_BAD.has(base)};}catch{return null;}
+}
+async function checkSemanticScholar(query,sig){
+  return safeCall(async()=>{
+    const r=await withTimeout(fetch("https://api.semanticscholar.org/graph/v1/paper/search?query="+encodeURIComponent(query.slice(0,200))+"&fields=title,year,citationCount,isRetracted,authors&limit=3",{signal:sig}),6000);
+    if(!r.ok)return null;const d=await r.json();
+    return(d.data||[]).map(p=>({title:p.title,year:p.year,citations:p.citationCount,retracted:p.isRetracted,authors:(p.authors||[]).slice(0,2).map(a=>a.name).join(", ")}));
+  });
+}
+async function queryGDELTTone(keywords,sig){
+  return safeCall(async()=>{
+    const r=await withTimeout(fetch("https://api.gdeltproject.org/api/v2/doc/doc?query="+encodeURIComponent(keywords.slice(0,100))+"&mode=tonechart&format=json",{signal:sig}),5000);
+    if(!r.ok)return null;const d=await r.json();const bins=d.tonechart||[];if(!bins.length)return null;
+    const avg=bins.reduce((s,b)=>s+parseFloat(b.tonescore||0),0)/bins.length;return{avgTone:avg.toFixed(2)};
+  });
+}
+async function queryFactCheckTools(url,sig){
+  return safeCall(async()=>{
+    const domain=new URL(url).hostname.replace("www.","");
+    const r=await withTimeout(fetch("https://factchecktools.googleapis.com/v1alpha1/claims:search?query="+encodeURIComponent(domain)+"&key=AIzaSyDemo_FactCheckAPI_NotReal",{signal:sig}),4000);
+    if(!r.ok)return null;const d=await r.json();
+    return(d.claims||[]).slice(0,5).map(c=>{const rv=(c.claimReview&&c.claimReview[0])||{};return{claim:c.text,claimant:c.claimant,date:c.claimDate,publisher:rv.publisher?.name,rating:rv.textualRating,url:rv.url};});
+  });
+}
+async function queryWayback(url,sig){
+  return safeCall(async()=>{
+    const encoded=encodeURIComponent(url);
+    const avail=await withTimeout(fetch("https://archive.org/wayback/available?url="+encoded,{signal:sig}),5000);
+    if(!avail.ok)return null;const ad=await avail.json();
+    const closest=ad.archived_snapshots?.closest;if(!closest?.available)return{available:false};
+    const snapTs=closest.timestamp;
+    const snapDate=snapTs.slice(0,4)+"-"+snapTs.slice(4,6)+"-"+snapTs.slice(6,8);
+    let firstSeen=null;
+    await safeCall(async()=>{
+      const cdxR=await withTimeout(fetch("https://web.archive.org/cdx/search/cdx?url="+encoded+"&output=json&limit=1&fl=timestamp&from=20000101",{signal:sig}),4000);
+      if(cdxR.ok){const cdx=await cdxR.json();if(cdx?.length>1){const ts=cdx[1][0];firstSeen=ts.slice(0,4)+"-"+ts.slice(4,6)+"-"+ts.slice(6,8);}}
+    });
+    let certAge=null;
+    await safeCall(async()=>{
+      const domain=new URL(url).hostname.replace("www.","");
+      const crtR=await withTimeout(fetch("https://crt.sh/?q="+domain+"&output=json",{signal:sig}),4000);
+      if(crtR.ok){const certs=await crtR.json();if(certs?.length){certAge=certs.reduce((min,c)=>c.not_before<min?c.not_before:min,certs[0].not_before)?.slice(0,10)??null;}}
+    });
+    return{available:true,latestSnapshot:snapDate,latestUrl:closest.url,firstSeen,certAge};
+  });
+}
+
+async function runOSINT(url,signal){
+  let domain="";try{domain=new URL(url).hostname.replace("www.","");}catch{}
+  const sig=signal;
+  // synchronous check first, then fire all async calls in parallel
+  const openSources=checkOpenSources(url);
+  const [gdelt,whois,scholar,tone,factChecks,wayback]=await Promise.all([
+    queryGDELT(url,sig),queryWHOIS(url,sig),checkSemanticScholar(domain,sig),
+    queryGDELTTone(domain,sig),queryFactCheckTools(url,sig),queryWayback(url,sig)
+  ]);
+  return{gdelt,whois,openSources,scholar,tone,factChecks,wayback};
 }
 
 // ── SOCIAL ────────────────────────────────────────────────────────────────────
 const SOCIAL_DOMAINS=new Set(["x.com","twitter.com","t.co","instagram.com","facebook.com","threads.net","bsky.app","tiktok.com"]);
 const SOCIAL_NAMES={"x.com":"X / Twitter","twitter.com":"X / Twitter","t.co":"X / Twitter","instagram.com":"Instagram","facebook.com":"Facebook","threads.net":"Threads","bsky.app":"Bluesky","tiktok.com":"TikTok"};
-function isSocialUrl(url){try{return SOCIAL_DOMAINS.has(new URL(url.trim()).hostname.replace("www.",""));}catch(e){return false;}}
+function isSocialUrl(url){try{return SOCIAL_DOMAINS.has(new URL(url.trim()).hostname.replace("www.",""));}catch{return false;}}
 function sanitizeSocial(raw){
   if(!raw||typeof raw!=="object")return null;
+  const PT=["FACT_CLAIM","OPINION","SATIRE","HUMOR","NEWS_SHARE","MISINFORMATION","UNKNOWN"];
+  const VR=["HIGH","MEDIUM","LOW"];const CO=["HIGH","MEDIUM","LOW"];
   return{
     platform:String(raw.platform||"Social Media").slice(0,40),
     author:String(raw.author||"Unknown").slice(0,80),
@@ -163,40 +205,39 @@ function sanitizeSocial(raw){
     authorAccountAge:String(raw.authorAccountAge||"Unknown").slice(0,30),
     authorCredibility:Math.max(0,Math.min(100,parseInt(raw.authorCredibility)||50)),
     postText:String(raw.postText||"").slice(0,600),
-    postType:["FACT_CLAIM","OPINION","SATIRE","HUMOR","NEWS_SHARE","MISINFORMATION","UNKNOWN"].includes(raw.postType)?raw.postType:"UNKNOWN",
+    postType:PT.includes(raw.postType)?raw.postType:"UNKNOWN",
     isOpinion:!!raw.isOpinion,
     claimsMade:Array.isArray(raw.claimsMade)?raw.claimsMade.slice(0,6).map(c=>String(c).slice(0,200)):[],
     imagesPresent:!!raw.imagesPresent,
     imageAnalysis:String(raw.imageAnalysis||"").slice(0,400),
-    linkedSources:Array.isArray(raw.linkedSources)?raw.linkedSources.slice(0,5).map(s=>String(s).slice(0,300)).filter(s=>isValidUrl(s)):[],
+    linkedSources:Array.isArray(raw.linkedSources)?raw.linkedSources.slice(0,5).map(s=>String(s).slice(0,300)).filter(isValidUrl):[],
     sourceCredibility:String(raw.sourceCredibility||"").slice(0,300),
     claimVerification:String(raw.claimVerification||"").slice(0,400),
     context:String(raw.context||"").slice(0,300),
-    viralRisk:["HIGH","MEDIUM","LOW"].includes(raw.viralRisk)?raw.viralRisk:"MEDIUM",
+    viralRisk:VR.includes(raw.viralRisk)?raw.viralRisk:"MEDIUM",
     viralReason:String(raw.viralReason||"").slice(0,200),
     overallVerdict:String(raw.overallVerdict||"").slice(0,400),
     truthScore:Math.max(0,Math.min(100,parseInt(raw.truthScore)||50)),
     opinionScore:Math.max(0,Math.min(100,parseInt(raw.opinionScore)||50)),
-    confidence:["HIGH","MEDIUM","LOW"].includes(raw.confidence)?raw.confidence:"MEDIUM",
+    confidence:CO.includes(raw.confidence)?raw.confidence:"MEDIUM",
   };
 }
-const SOCIAL_SYS=`You are an expert social media fact-checker. Analyze the given social media post URL using web search. Return ONLY valid JSON, no markdown:
-{"platform":"<n>","author":"<@handle>","authorVerified":<bool>,"authorFollowers":"<count>","authorAccountAge":"<age>","authorCredibility":<0-100>,"postText":"<text up to 300 chars>","postType":"FACT_CLAIM|OPINION|SATIRE|HUMOR|NEWS_SHARE|MISINFORMATION|UNKNOWN","isOpinion":<bool>,"claimsMade":["<factual claim>"],"imagesPresent":<bool>,"imageAnalysis":"<desc>","linkedSources":["<url>"],"sourceCredibility":"<1 sentence>","claimVerification":"<do claims appear in verifiable sources?>","context":"<context>","viralRisk":"HIGH|MEDIUM|LOW","viralReason":"<why>","overallVerdict":"<1-2 sentence verdict>","truthScore":<0-100>,"opinionScore":<0-100>,"confidence":"HIGH|MEDIUM|LOW"}`;
 
-async function analyzeSocialPost(url){
-  try{
-    const uMsg="Analyze this social media post — find the content, images, author details, and fact-check any specific claims: "+url;
-    const s1=await withTimeout(fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1500,system:SOCIAL_SYS,tools:[{type:"web_search_20250305",name:"web_search"}],messages:[{role:"user",content:uMsg}]})}),25000);
-    if(!s1.ok)return null;const d1=await s1.json();if(d1.error)return null;
-    const s2=await withTimeout(fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1500,system:SOCIAL_SYS,messages:[{role:"user",content:uMsg},{role:"assistant",content:d1.content},{role:"user",content:"Output ONLY the JSON object."}]})}),15000);
-    if(!s2.ok)return null;const d2=await s2.json();
-    const txt=(d2.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("").replace(/```json\n?|```\n?/g,"").trim();
+// Single-shot social analysis (one API call with web_search)
+const SOCIAL_SYS=`You are an expert social media fact-checker. Use web_search to find the post, then return ONLY valid JSON — no markdown:
+{"platform":"<n>","author":"<@handle>","authorVerified":<bool>,"authorFollowers":"<count>","authorAccountAge":"<age>","authorCredibility":<0-100>,"postText":"<text up to 300 chars>","postType":"FACT_CLAIM|OPINION|SATIRE|HUMOR|NEWS_SHARE|MISINFORMATION|UNKNOWN","isOpinion":<bool>,"claimsMade":["<factual claim>"],"imagesPresent":<bool>,"imageAnalysis":"<desc>","linkedSources":["<url>"],"sourceCredibility":"<1 sentence>","claimVerification":"<verification>","context":"<context>","viralRisk":"HIGH|MEDIUM|LOW","viralReason":"<why>","overallVerdict":"<1-2 sentence verdict>","truthScore":<0-100>,"opinionScore":<0-100>,"confidence":"HIGH|MEDIUM|LOW"}`;
+
+async function analyzeSocialPost(url,signal){
+  return safeCall(async()=>{
+    const res=await withTimeout(fetch("/api/proxy",{method:"POST",signal,headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1500,system:SOCIAL_SYS,tools:[{type:"web_search_20250305",name:"web_search"}],tool_choice:{type:"auto"},messages:[{role:"user",content:"Analyze this social media post and return the JSON: "+url}]})}),28000);
+    if(!res.ok)return null;const d=await res.json();if(d.error)return null;
+    const txt=(d.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("").replace(/```json\n?|```\n?/g,"").trim();
     const m=txt.match(/\{[\s\S]*\}/);if(!m)return null;
     return sanitizeSocial(JSON.parse(m[0]));
-  }catch(e){return null;}
+  });
 }
 
-function domainName(url){try{return new URL(url).hostname.replace("www.","");}catch(e){return url;}}
+function domainName(url){try{return new URL(url).hostname.replace("www.","");}catch{return url;}}
 function domainKey(url){return"rep:"+domainName(url).replace(/[^\w.-]/g,"_");}
 async function saveRep(r,url,osint,ci){
   try{
@@ -212,8 +253,8 @@ async function saveRep(r,url,osint,ci){
     Object.defineProperty(window,"__TRUTHILIZER_INDEX__",{value:Object.freeze(JSON.parse(JSON.stringify(idx))),configurable:true,writable:false});
   }catch(e){console.warn("storage:",e);}
 }
-async function loadIdx(){try{const r=await window.storage.get("idx",true);return r?JSON.parse(r.value):{};}catch(e){return{};}}
-async function loadHist(d){try{const r=await window.storage.get("rep:"+d.replace(/[^\w.-]/g,"_"));return r?JSON.parse(r.value):[];}catch(e){return[];}}
+async function loadIdx(){try{const r=await window.storage.get("idx",true);return r?JSON.parse(r.value):{};}catch{return{};}}
+async function loadHist(d){try{const r=await window.storage.get("rep:"+d.replace(/[^\w.-]/g,"_"));return r?JSON.parse(r.value):[];}catch{return[];}}
 
 // ── AUDIO ─────────────────────────────────────────────────────────────────────
 function useAudio(){
@@ -221,7 +262,7 @@ function useAudio(){
   const getCtx=useCallback(()=>{if(!state.current.actx||state.current.actx.state==="closed")state.current.actx=new(window.AudioContext||window.webkitAudioContext)();if(state.current.actx.state==="suspended")state.current.actx.resume();return state.current.actx;},[]);
   const mkOsc=useCallback((c,freq,type,s,e,vol)=>{const o=c.createOscillator(),g=c.createGain();o.type=type;o.frequency.value=freq;g.gain.setValueAtTime(vol||0.07,s);g.gain.exponentialRampToValueAtTime(0.0001,e);o.connect(g);g.connect(c.destination);o.start(s);o.stop(e);state.current.nodes.push(o);},[]);
   const mkNoise=useCallback((c,s,dur,vol)=>{const len=Math.floor(c.sampleRate*dur),buf=c.createBuffer(1,len,c.sampleRate),d=buf.getChannelData(0);for(let i=0;i<len;i++)d[i]=Math.random()*2-1;const src=c.createBufferSource(),g=c.createGain();g.gain.setValueAtTime(vol||0.05,s);g.gain.exponentialRampToValueAtTime(0.0001,s+dur);src.buffer=buf;src.connect(g);g.connect(c.destination);src.start(s);src.stop(s+dur);state.current.nodes.push(src);},[]);
-  const stop=useCallback(()=>{state.current.nodes.forEach(n=>{try{n.stop();}catch(e){}});state.current.nodes=[];state.current.genre=null;},[]);
+  const stop=useCallback(()=>{state.current.nodes.forEach(n=>{try{n.stop();}catch{}});state.current.nodes=[];state.current.genre=null;},[]);
   const schedLoop=useCallback((genre,fn)=>{state.current.genre=genre;let t=getCtx().currentTime+0.05;function tick(){if(state.current.genre!==genre)return;t+=fn(t);setTimeout(tick,Math.max(50,(t-getCtx().currentTime)*1000-300));}tick();},[getCtx]);
   const play=useCallback((id)=>{stop();const c=getCtx();
     if(id==="lofi")schedLoop("lofi",t=>{const ch=[[261.6,329.6,392,493.9],[220,261.6,329.6,440],[174.6,220,261.6,349.2],[196,246.9,293.7,392]][Math.floor(Math.random()*4)];ch.forEach(f=>mkOsc(c,f,"triangle",t,t+2.3,0.05));mkOsc(c,ch[0]/2,"sine",t,t+1.8,0.11);[0,.25,.5,.75].forEach(off=>mkNoise(c,t+off,.04,.04));return 2.8;});
@@ -235,31 +276,36 @@ function useAudio(){
   const api=useRef({play,stop,beep,chime,hover,tick});api.current={play,stop,beep,chime,hover,tick};return api;
 }
 
-// ── NEON ──────────────────────────────────────────────────────────────────────
+// ── NEON — shared RAF, stable closures ────────────────────────────────────────
 function useNeon(color){
-  const ref=useRef(null),tRef=useRef(Math.random()*Math.PI*2),rafRef=useRef(null);
+  const ref=useRef(null);
+  const tRef=useRef(Math.random()*Math.PI*2);
+  const colorRef=useRef(color);
+  colorRef.current=color; // always fresh without re-subscribing
   useEffect(()=>{
     const el=ref.current;if(!el)return;
-    function tick(){tRef.current+=0.025;const t=tRef.current,p1=0.6+Math.sin(t*1.1)*0.4,p2=0.55+Math.sin(t*1.7+1.2)*0.45;
-    const rgb=hexRgb(color),r=rgb[0],g=rgb[1],b=rgb[2];
-    const c0=`rgba(${r},${g},${b},1)`,c1=`rgba(${r},${g},${b},${(p1*.95).toFixed(2)})`,c2=`rgba(${r},${g},${b},${(p2*.75).toFixed(2)})`,c3=`rgba(${r},${g},${b},${(p1*.45).toFixed(2)})`,c4=`rgba(${r},${g},${b},${(p2*.2).toFixed(2)})`;
-    el.style.boxShadow=[`0 0 0 1px ${c0}`,`0 0 3px 1px ${c3}`,`0 0 9px 2px ${c2}`,`0 0 20px 4px ${c1}`,`0 0 40px 8px ${c4}`,`inset 0 0 8px 0 ${c4}`].join(", ");
-    rafRef.current=requestAnimationFrame(tick);}
-    rafRef.current=requestAnimationFrame(tick);
-    return()=>cancelAnimationFrame(rafRef.current);
-  },[color]);
+    return subRaf(()=>{
+      tRef.current+=0.025;const t=tRef.current,p1=0.6+Math.sin(t*1.1)*0.4,p2=0.55+Math.sin(t*1.7+1.2)*0.45;
+      const rgb=hexRgb(colorRef.current),r=rgb[0],g=rgb[1],b=rgb[2];
+      const c0=`rgba(${r},${g},${b},1)`,c1=`rgba(${r},${g},${b},${(p1*.95).toFixed(2)})`,c2=`rgba(${r},${g},${b},${(p2*.75).toFixed(2)})`,c3=`rgba(${r},${g},${b},${(p1*.45).toFixed(2)})`,c4=`rgba(${r},${g},${b},${(p2*.2).toFixed(2)})`;
+      el.style.boxShadow=[`0 0 0 1px ${c0}`,`0 0 3px 1px ${c3}`,`0 0 9px 2px ${c2}`,`0 0 20px 4px ${c1}`,`0 0 40px 8px ${c4}`,`inset 0 0 8px 0 ${c4}`].join(", ");
+    });
+  },[]); // empty deps — color is read via ref
   return ref;
 }
 function useNeonEdge(color){
-  const ref=useRef(null),tRef=useRef(Math.random()*Math.PI*2),rafRef=useRef(null);
+  const ref=useRef(null);
+  const tRef=useRef(Math.random()*Math.PI*2);
+  const colorRef=useRef(color);
+  colorRef.current=color;
   useEffect(()=>{
     const el=ref.current;if(!el)return;
-    function tick(){tRef.current+=0.025;const t=tRef.current,p=0.6+Math.sin(t*1.1)*0.4;const rgb=hexRgb(color),r=rgb[0],g=rgb[1],b=rgb[2];
-    el.style.boxShadow=`0 1px 0 0 rgba(${r},${g},${b},1), 0 2px 8px 0 rgba(${r},${g},${b},${(p*.75).toFixed(2)}), 0 4px 18px 0 rgba(${r},${g},${b},${(p*.4).toFixed(2)})`;
-    rafRef.current=requestAnimationFrame(tick);}
-    rafRef.current=requestAnimationFrame(tick);
-    return()=>cancelAnimationFrame(rafRef.current);
-  },[color]);
+    return subRaf(()=>{
+      tRef.current+=0.025;const t=tRef.current,p=0.6+Math.sin(t*1.1)*0.4;
+      const rgb=hexRgb(colorRef.current),r=rgb[0],g=rgb[1],b=rgb[2];
+      el.style.boxShadow=`0 1px 0 0 rgba(${r},${g},${b},1), 0 2px 8px 0 rgba(${r},${g},${b},${(p*.75).toFixed(2)}), 0 4px 18px 0 rgba(${r},${g},${b},${(p*.4).toFixed(2)})`;
+    });
+  },[]);
   return ref;
 }
 function LiveBorder({color,style,children}){const ref=useNeon(color||P.teal);return <div ref={ref} style={{borderRadius:4,...style}}>{children}</div>;}
@@ -278,6 +324,7 @@ const ScrambleText=memo(({text,active})=>{
   },[active,text]);
   return <span>{display}</span>;
 });
+
 function SlideIn({children,delay}){
   const [v,setV]=useState(false);
   useEffect(()=>{const t=setTimeout(()=>setV(true),delay||0);return()=>clearTimeout(t);},[delay]);
@@ -307,11 +354,11 @@ function Eyes({scoreRef}){
   const r1=useRef(null),r2=useRef(null),tRef=useRef(0);
   const grids=useRef([Array.from({length:EYE_R},()=>Array(EYE_C).fill(".")),Array.from({length:EYE_R},()=>Array(EYE_C).fill("."))]);
   useEffect(()=>{
-    let raf;const CH=13,CW=8;const canvases=[r1.current,r2.current];const ctxs=canvases.map(c=>c.getContext("2d"));
+    const CH=13,CW=8;const canvases=[r1.current,r2.current];const ctxs=canvases.map(c=>c.getContext("2d"));
     MASK.forEach(p=>{grids.current[0][p[1]][p[0]]=POOL[Math.floor(Math.random()*POOL.length)];grids.current[1][p[1]][p[0]]=POOL[Math.floor(Math.random()*POOL.length)];});
     canvases.forEach(c=>{c.width=EYE_C*CW;c.height=EYE_R*CH;});
     const blink={next:3+Math.random()*4,dur:.18,t:0};
-    function draw(){
+    const unsub=subRaf(()=>{
       tRef.current+=.004;const t=tRef.current;
       if(t>=blink.next){blink.t=t;blink.next=t+2.5+Math.random()*5;}
       const bp=t-blink.t,blinkP=(bp>=0&&bp<blink.dur)?Math.sin((bp/blink.dur)*Math.PI):0;
@@ -333,9 +380,8 @@ function Eyes({scoreRef}){
           ctx.fillStyle=col;ctx.fillText(ch,c*CW+2,r*CH+CH-2);
         });
       });
-      raf=requestAnimationFrame(draw);
-    }
-    raf=requestAnimationFrame(draw);return()=>cancelAnimationFrame(raf);
+    });
+    return unsub;
   },[]);
   return <div><div style={{background:P.bg,padding:"20px 0 16px",display:"flex",justifyContent:"center",alignItems:"center",gap:52}}><canvas ref={r1} style={{imageRendering:"pixelated"}} /><canvas ref={r2} style={{imageRendering:"pixelated"}} /></div><NeonLine color={P.teal} /></div>;
 }
@@ -344,6 +390,7 @@ function Eyes({scoreRef}){
 const NeonCell=memo(({color,style,pad,children})=>{const ref=useNeon(color||P.border);return <div ref={ref} style={{background:P.bg,borderRadius:3,padding:pad||"5px 8px",...style}}>{children}</div>;});
 const Badge=memo(({color,text})=>{const c=color||P.teal,ref=useNeon(c);return <span ref={ref} style={{fontFamily:M,fontSize:8,background:c+"22",color:c,padding:"2px 7px",borderRadius:2,marginRight:4,marginBottom:3,display:"inline-block",letterSpacing:.5}}>{text}</span>;});
 const Bar=memo(({score,h})=>{const c=scoreColor(score),ht=h||5,ref=useNeon(c);return <div style={{display:"flex",alignItems:"center",gap:8}}><div ref={ref} style={{flex:1,height:ht,background:P.bg,borderRadius:3,overflow:"hidden"}}><div style={{width:score+"%",height:"100%",background:c,borderRadius:3,transition:"width 1.2s cubic-bezier(.4,0,.2,1)"}} /></div><span style={{fontFamily:M,fontSize:10,color:c,minWidth:28,textAlign:"right"}}>{score}</span></div>;});
+
 function SpectrumBar({labels,values}){
   if(!labels||!values)return null;
   const max=Math.max(...values),idx=values.indexOf(max),pct=(idx/(labels.length-1))*100,bc=pct<35?P.blue:pct>65?P.red:P.amber,ref=useNeon(bc);
@@ -354,15 +401,21 @@ function SpectrumBar({labels,values}){
     <div style={{position:"absolute",top:0,bottom:0,width:3,background:bc,borderRadius:2,left:`calc(${pct}% - 1px)`,transition:"left 1s"}} />
   </div><div style={{display:"flex",justifyContent:"space-between"}}><span style={{fontFamily:M,fontSize:7,color:P.blue}}>LEFT</span><span style={{fontFamily:M,fontSize:8,color:bc}}>{labels[idx]||"—"}</span><span style={{fontFamily:M,fontSize:7,color:P.red}}>RIGHT</span></div></div>;
 }
-const PANEL_BG=[P.panel,P.alt];
-let panelIdx=0;
-function ACard({color,style,title,children}){const bg=PANEL_BG[panelIdx++%2];return <LiveBorder color={color||P.border} style={{background:bg,borderRadius:4,marginBottom:6,...style}}><div style={{padding:"10px 14px"}}>{title&&<div style={{fontFamily:M,fontSize:8,color:P.dim,letterSpacing:2,marginBottom:8}}>{title}</div>}{children}</div></LiveBorder>;}
+
+// Alternating panel bg using a ref so it's stable across renders
+function useAltBg(){const r=useRef(null);if(r.current===null)r.current=Math.random()<.5;return r.current?P.alt:P.panel;}
+
+function ACard({color,style,title,children}){
+  const bg=useAltBg();
+  return <LiveBorder color={color||P.border} style={{background:bg,borderRadius:4,marginBottom:6,...style}}><div style={{padding:"10px 14px"}}>{title&&<div style={{fontFamily:M,fontSize:8,color:P.dim,letterSpacing:2,marginBottom:8}}>{title}</div>}{children}</div></LiveBorder>;
+}
 function Group({title,color,urgentCount,defaultOpen,audioRef,children}){
   const [open,setOpen]=useState(defaultOpen||false);
   const bc=urgentCount>0?P.red:color,bodyRef=useNeon(bc);
+  const handleClick=useCallback(()=>{if(audioRef)audioRef.current.hover(open?330:440);setOpen(o=>!o);},[open,audioRef]);
   return <div style={{marginBottom:10}}>
     <LiveBorder color={bc} style={{background:urgentCount>0?P.redD+"44":P.panel,borderRadius:open?"4px 4px 0 0":"4px"}}>
-      <button onClick={()=>{if(audioRef)audioRef.current.hover(open?330:440);setOpen(o=>!o);}} style={{width:"100%",background:"transparent",border:"none",padding:"12px 14px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",fontFamily:M,fontSize:10,color:bc,letterSpacing:2}}>
+      <button onClick={handleClick} style={{width:"100%",background:"transparent",border:"none",padding:"12px 14px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",fontFamily:M,fontSize:10,color:bc,letterSpacing:2}}>
         <span>{urgentCount>0?"⚠ ":""}{title}</span>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           {urgentCount>0&&<span style={{fontFamily:M,fontSize:8,background:P.red+"33",color:P.red,padding:"2px 8px",borderRadius:2,boxShadow:`0 0 8px 2px rgba(255,34,85,0.5)`}}>{urgentCount} FLAG{urgentCount>1?"S":""}</span>}
@@ -376,9 +429,10 @@ function Group({title,color,urgentCount,defaultOpen,audioRef,children}){
 function Sub({title,color,urgent,audioRef,children}){
   const [open,setOpen]=useState(urgent||false);
   const c=urgent?P.red:(color||P.dim),ref=useNeon(c);
+  const handleClick=useCallback(()=>{if(audioRef)audioRef.current.hover(open?280:380);setOpen(o=>!o);},[open,audioRef]);
   return <div style={{marginBottom:6}}>
     <div ref={ref} style={{borderRadius:open?"4px 4px 0 0":"4px",overflow:"hidden"}}>
-      <button onClick={()=>{if(audioRef)audioRef.current.hover(open?280:380);setOpen(o=>!o);}} style={{width:"100%",background:"transparent",border:"none",padding:"8px 10px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",fontFamily:M,fontSize:9,color:c,letterSpacing:1,textAlign:"left"}}>
+      <button onClick={handleClick} style={{width:"100%",background:"transparent",border:"none",padding:"8px 10px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",fontFamily:M,fontSize:9,color:c,letterSpacing:1,textAlign:"left"}}>
         <span>{urgent?"⚠ ":""}{title}</span>
         <span style={{fontSize:9,color:P.dim,marginLeft:8}}>{open?"▲":"▼"}</span>
       </button>
@@ -388,39 +442,33 @@ function Sub({title,color,urgent,audioRef,children}){
 }
 function TruthSegment({filled,col,delay}){const ref=useNeon(filled?col:P.border);return <div ref={ref} style={{flex:1,height:14,background:filled?col:P.bg,borderRadius:2,transition:`background ${delay}s`}} />;}
 
-// ── VERDICT BADGE ─────────────────────────────────────────────────────────────
 function VerdictFade({score}){
   const c=scoreColor(score),ref=useNeon(c);
-  const label=score>65?"VERIFIED":score>40?"DEGRADED":"CORRUPTED";
-  const sub=score>65?"Signal integrity nominal":"Signal interference detected";
   return <div ref={ref} style={{background:c+"18",borderRadius:4,padding:"8px 14px",marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-    <span style={{fontFamily:M,fontSize:11,color:c,letterSpacing:4}}>◈ SIGNAL {label}</span>
-    <span style={{fontFamily:M,fontSize:8,color:c+"aa",letterSpacing:1}}>{sub}</span>
+    <span style={{fontFamily:M,fontSize:11,color:c,letterSpacing:4}}>◈ SIGNAL {score>65?"VERIFIED":score>40?"DEGRADED":"CORRUPTED"}</span>
+    <span style={{fontFamily:M,fontSize:8,color:c+"aa",letterSpacing:1}}>{score>65?"Signal integrity nominal":"Signal interference detected"}</span>
   </div>;
 }
-
-// ── CONFIDENCE ────────────────────────────────────────────────────────────────
 function ConfidenceBand({ci}){
   if(!ci)return null;
-  const agreeColor=ci.agreement==="HIGH"?P.green:ci.agreement==="MEDIUM"?P.amber:P.red;
-  const ref=useNeon(agreeColor);
+  const ac=ci.agreement==="HIGH"?P.green:ci.agreement==="MEDIUM"?P.amber:P.red,ref=useNeon(ac);
   const mid=Math.round((ci.low+ci.high)/2);
   return <div ref={ref} style={{background:P.panel,borderRadius:4,padding:"10px 14px",marginBottom:8}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
       <span style={{fontFamily:M,fontSize:8,color:P.dim,letterSpacing:2}}>CONFIDENCE INTERVAL</span>
       <div style={{display:"flex",gap:10,alignItems:"center"}}>
-        <span style={{fontFamily:M,fontSize:8,color:agreeColor}}>AGREEMENT: {ci.agreement}</span>
+        <span style={{fontFamily:M,fontSize:8,color:ac}}>AGREEMENT: {ci.agreement}</span>
         <span style={{fontFamily:M,fontSize:8,color:P.dim}}>{ci.signalCount} signals</span>
       </div>
     </div>
     <div style={{position:"relative",height:20,background:P.bg,borderRadius:3,marginBottom:6}}>
-      <div style={{position:"absolute",left:ci.low+"%",width:(ci.high-ci.low)+"%",top:0,bottom:0,background:agreeColor+"33",borderRadius:3,transition:"all 1s"}} />
-      <div style={{position:"absolute",left:`calc(${mid}% - 1px)`,top:0,bottom:0,width:2,background:agreeColor,borderRadius:1,transition:"left 1s"}} />
+      <div style={{position:"absolute",left:ci.low+"%",width:(ci.high-ci.low)+"%",top:0,bottom:0,background:ac+"33",borderRadius:3,transition:"all 1s"}} />
+      <div style={{position:"absolute",left:`calc(${mid}% - 1px)`,top:0,bottom:0,width:2,background:ac,borderRadius:1,transition:"left 1s"}} />
     </div>
     <div style={{display:"flex",justifyContent:"space-between"}}>
-      <span style={{fontFamily:M,fontSize:9,color:agreeColor}}>{ci.low}%</span>
+      <span style={{fontFamily:M,fontSize:9,color:ac}}>{ci.low}%</span>
       <span style={{fontFamily:M,fontSize:8,color:P.dim}}>±{ci.stdDev} pts</span>
-      <span style={{fontFamily:M,fontSize:9,color:agreeColor}}>{ci.high}%</span>
+      <span style={{fontFamily:M,fontSize:9,color:ac}}>{ci.high}%</span>
     </div>
   </div>;
 }
@@ -430,7 +478,7 @@ function SocialPanel({social:s,audioRef}){
   if(!s)return null;
   const isOpinion=s.isOpinion||s.opinionScore>60;
   const accentColor=isOpinion?P.amber:s.truthScore>65?P.green:s.truthScore>40?P.amber:P.red;
-  const typeColor={FACT_CLAIM:P.blue,OPINION:P.amber,SATIRE:P.purple,HUMOR:P.purple,NEWS_SHARE:P.teal,MISINFORMATION:P.red,UNKNOWN:P.dim}[s.postType]||P.dim;
+  const typeColor=useMemo(()=>({FACT_CLAIM:P.blue,OPINION:P.amber,SATIRE:P.purple,HUMOR:P.purple,NEWS_SHARE:P.teal,MISINFORMATION:P.red,UNKNOWN:P.dim})[s.postType]||P.dim,[s.postType]);
   const viralColor=s.viralRisk==="HIGH"?P.red:s.viralRisk==="MEDIUM"?P.amber:P.green;
   return <Group title={"SOCIAL SIGNAL  ·  "+(s.platform||"SOCIAL")} color={P.pink} urgentCount={(!isOpinion&&s.truthScore<40)?1:0} defaultOpen audioRef={audioRef}>
     <div style={{display:"flex",gap:6,marginBottom:10,flexWrap:"wrap",alignItems:"center"}}>
@@ -450,9 +498,6 @@ function SocialPanel({social:s,audioRef}){
         <p style={{fontFamily:M,fontSize:10,color:P.text,margin:0,lineHeight:1.9,whiteSpace:"pre-wrap"}}>"{s.postText}"</p>
       </div>
       {s.context&&<p style={{fontFamily:M,fontSize:9,color:P.dim,margin:"6px 0 0",lineHeight:1.6}}>{s.context}</p>}
-    </Sub>}
-    {s.imagesPresent&&<Sub title="Image Analysis" color={P.purple} audioRef={audioRef}>
-      <p style={{fontFamily:M,fontSize:10,color:P.text,margin:"6px 0 0",lineHeight:1.7}}>{s.imageAnalysis||"Images present but could not be analyzed."}</p>
     </Sub>}
     {s.claimsMade?.length>0&&<Sub title={"Claims Made  ·  "+s.claimsMade.length+" identified"} color={isOpinion?P.amber:P.blue} audioRef={audioRef}>
       {isOpinion&&<p style={{fontFamily:M,fontSize:9,color:P.amber,margin:"0 0 8px",lineHeight:1.6}}>⚠ These appear to be opinions, not verifiable factual claims.</p>}
@@ -485,8 +530,8 @@ function MusicPanel({audioRef,score}){
   const [active,setActive]=useState(null);
   const prevAuto=useRef(null);
   useEffect(()=>{if(autoGenre&&autoGenre!==prevAuto.current){prevAuto.current=autoGenre;setActive(autoGenre);audioRef.current.play(autoGenre);}},[autoGenre]);
-  const stations=[{id:"lofi",label:"LO-FI",color:P.teal},{id:"jazz",label:"JAZZ",color:P.amber},{id:"metal",label:"METAL",color:P.red}];
-  function toggle(id){audioRef.current.beep();if(active===id){audioRef.current.stop();setActive(null);}else{audioRef.current.play(id);setActive(id);}}
+  const stations=useMemo(()=>[{id:"lofi",label:"LO-FI",color:P.teal},{id:"jazz",label:"JAZZ",color:P.amber},{id:"metal",label:"METAL",color:P.red}],[]);
+  const toggle=useCallback((id)=>{audioRef.current.beep();if(active===id){audioRef.current.stop();setActive(null);}else{audioRef.current.play(id);setActive(id);}},[active,audioRef]);
   const st=stations.find(s=>s.id===active);
   return <ACard title="AUDIO CHANNEL" color={P.audio}>
     <div style={{display:"flex",gap:8,marginBottom:active?10:0}}>
@@ -511,21 +556,20 @@ function TruthMeter({score}){
   </LiveBorder>;
 }
 
-// ── SUMMARY CARD ──────────────────────────────────────────────────────────────
 function SummaryCard({r,osint,ci}){
   const c=scoreColor(r.overallScore);
+  const pre=useMemo(()=>osint?osintPreScore(osint):null,[osint]);
   const entries=Object.entries(r.criteria||{});
   const worst=entries.length?entries.sort((a,b)=>a[1].score-b[1].score)[0]:null;
   const LABELS={source:"Source",funding:"Funding",author:"Author",authorPay:"Who Pays",copyPaste:"Originality",study:"Study",academic:"Academic",factCheck:"Fact-Check"};
   const vs=(r.politicalLeanings?.values)||[];const ls=(r.politicalLeanings?.labels)||[];
   const mi=vs.indexOf(Math.max(...(vs.length?vs:[0])));
-  const pre=osint?osintPreScore(osint):null;
-  const tiles=[
+  const tiles=useMemo(()=>[
     {label:"TRUTH SCORE",val:r.overallScore+"%",col:c},
     {label:"OSINT SIGNAL",val:pre?pre.score+"%":"—",col:pre?scoreColor(pre.score):P.dim},
     {label:"WORST FLAG",val:worst?(LABELS[worst[0]]||worst[0])+" ("+worst[1].score+")":"—",col:worst?scoreColor(worst[1].score):P.dim},
     {label:"POLITICAL",val:Math.max(...(vs.length?vs:[0]))>20?(ls[mi]||"—"):"Center",col:P.amber},
-  ];
+  ],[r,pre,worst,vs,ls,mi,c]);
   return <LiveBorder color={c} style={{background:P.panel,borderRadius:4,marginBottom:8}}>
     <div style={{padding:"14px"}}>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:8,marginBottom:12}}>
@@ -536,7 +580,6 @@ function SummaryCard({r,osint,ci}){
   </LiveBorder>;
 }
 
-// ── CACHE HIT BANNER ──────────────────────────────────────────────────────────
 function CacheBanner({cachedAt,onReanalyze}){
   const ref=useNeon(P.orange);
   const age=Math.round((Date.now()-cachedAt)/60000);
@@ -549,8 +592,9 @@ function CacheBanner({cachedAt,onReanalyze}){
 
 // ── OSINT PANEL ───────────────────────────────────────────────────────────────
 function OSINTPanel({osint,audioRef}){
+  const pre=useMemo(()=>osint?osintPreScore(osint):null,[osint]);
   if(!osint)return null;
-  const pre=osintPreScore(osint),urgent=pre&&pre.score<40;
+  const urgent=pre&&pre.score<40;
   return <Group title="OSINT PRE-FLIGHT" color={P.purple} urgentCount={urgent?1:0} defaultOpen={urgent} audioRef={audioRef}>
     {pre&&<div style={{marginBottom:12}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:6}}>
@@ -565,19 +609,19 @@ function OSINTPanel({osint,audioRef}){
         {[{l:"REGISTERED",v:osint.whois.created},{l:"AGE",v:osint.whois.ageYears+" years"},{l:"REGISTRAR",v:osint.whois.registrar},{l:"RISK",v:osint.whois.ageDays<90?"HIGH":osint.whois.ageDays<365?"MEDIUM":"LOW"}].map(item=><NeonCell key={item.l} color={P.border}><div style={{fontFamily:M,fontSize:7,color:P.dim,marginBottom:2}}>{item.l}</div><div style={{fontFamily:M,fontSize:9,color:P.text}}>{item.v||"—"}</div></NeonCell>)}
       </div>
     </Sub>}
-    {osint.wayback&&<Sub title={"Wayback Machine  ·  "+(osint.wayback.available?"Archived":"Not Archived")} color={osint.wayback.available?P.teal:P.red} urgent={!osint.wayback.available} audioRef={audioRef}>
+    {osint.wayback&&<Sub title={"Wayback  ·  "+(osint.wayback.available?"Archived":"Not Archived")} color={osint.wayback.available?P.teal:P.red} urgent={!osint.wayback.available} audioRef={audioRef}>
       {!osint.wayback.available?<p style={{fontFamily:M,fontSize:10,color:P.red,margin:"6px 0 0",lineHeight:1.7}}>No archive record found.</p>
       :<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginTop:6}}>
-        {[{l:"FIRST SEEN",v:osint.wayback.firstSeen||"Unknown"},{l:"LATEST SNAPSHOT",v:osint.wayback.latestSnapshot||"Unknown"},{l:"SSL CERT SINCE",v:osint.wayback.certAge||"Unknown"},{l:"CERT VS ARCHIVE",v:osint.wayback.certAge&&osint.wayback.firstSeen&&parseInt(osint.wayback.certAge.slice(0,4))>parseInt(osint.wayback.firstSeen.slice(0,4))+2?"MISMATCH ⚠":"OK"}].map(item=>{const warn=item.v?.includes("MISMATCH");return <NeonCell key={item.l} color={warn?P.red:P.border}><div style={{fontFamily:M,fontSize:7,color:P.dim,marginBottom:2}}>{item.l}</div><div style={{fontFamily:M,fontSize:9,color:warn?P.red:P.text}}>{item.v}</div></NeonCell>;})}
+        {[{l:"FIRST SEEN",v:osint.wayback.firstSeen||"Unknown"},{l:"LATEST SNAPSHOT",v:osint.wayback.latestSnapshot||"Unknown"},{l:"SSL CERT SINCE",v:osint.wayback.certAge||"Unknown"},{l:"CERT VS ARCHIVE",v:osint.wayback.certAge&&osint.wayback.firstSeen&&parseInt(osint.wayback.certAge)>parseInt(osint.wayback.firstSeen)+2?"MISMATCH ⚠":"OK"}].map(item=>{const warn=item.v?.includes("MISMATCH");return <NeonCell key={item.l} color={warn?P.red:P.border}><div style={{fontFamily:M,fontSize:7,color:P.dim,marginBottom:2}}>{item.l}</div><div style={{fontFamily:M,fontSize:9,color:warn?P.red:P.text}}>{item.v}</div></NeonCell>;})}
         {osint.wayback.latestUrl&&<div style={{gridColumn:"1/-1",marginTop:4}}><a href={safeHref(osint.wayback.latestUrl)} target="_blank" rel="noopener noreferrer" style={{fontFamily:M,fontSize:9,color:P.teal,textDecoration:"none"}}>View latest snapshot ↗</a></div>}
       </div>}
     </Sub>}
     {osint.factChecks?.length>0&&<Sub title={"Fact-Check Records  ·  "+osint.factChecks.length+" found"} color={P.pink} urgent={osint.factChecks.some(c=>{const neg=["false","mostly false","pants on fire","four pinocchios"];return c.rating&&neg.some(n=>c.rating.toLowerCase().includes(n));})} audioRef={audioRef}>
       {osint.factChecks.map((fc,i)=>{const neg=["false","mostly false","pants on fire","four pinocchios","misleading"];const isFalse=fc.rating&&neg.some(n=>fc.rating.toLowerCase().includes(n));return <div key={i}><div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:4}}><Badge text={fc.rating||"Checked"} color={isFalse?P.red:P.green}/>{fc.publisher&&<Badge text={fc.publisher} color={P.teal}/>}</div>{fc.claim&&<p style={{fontFamily:M,fontSize:9,color:P.text,margin:"0 0 4px",lineHeight:1.6}}>{fc.claim}</p>}{fc.url&&<a href={safeHref(fc.url)} target="_blank" rel="noopener noreferrer" style={{fontFamily:M,fontSize:8,color:P.teal,textDecoration:"none"}}>View ↗</a>}{i<osint.factChecks.length-1&&<NeonDivider color={P.pink} mt={6} mb={6}/>}</div>;})}
     </Sub>}
-    {osint.gdelt&&<Sub title={"GDELT Coverage  ·  "+osint.gdelt.count+" global articles"} color={osint.gdelt.count===0?P.red:P.green} urgent={osint.gdelt.count===0} audioRef={audioRef}>
+    {osint.gdelt&&<Sub title={"GDELT Coverage  ·  "+osint.gdelt.count+" articles"} color={osint.gdelt.count===0?P.red:P.green} urgent={osint.gdelt.count===0} audioRef={audioRef}>
       {osint.gdelt.count===0?<p style={{fontFamily:M,fontSize:10,color:P.red,margin:"6px 0 0",lineHeight:1.7}}>No mainstream global coverage found.</p>
-      :<div style={{marginTop:6}}><div style={{fontFamily:M,fontSize:8,color:P.dim,marginBottom:4}}>SOURCES REPORTING</div>{osint.gdelt.sources.map((s,i)=><Badge key={i} text={s} color={P.teal}/>)}{osint.gdelt.raw.map((a,i)=><div key={i}><a href={safeHref(a.url)} target="_blank" rel="noopener noreferrer" style={{fontFamily:M,fontSize:9,color:P.teal,textDecoration:"none"}}>{a.title||a.url} ↗</a>{i<osint.gdelt.raw.length-1&&<NeonDivider color={P.teal} mt={5} mb={5}/>}</div>)}</div>}
+      :<div style={{marginTop:6}}>{osint.gdelt.sources.map((s,i)=><Badge key={i} text={s} color={P.teal}/>)}{osint.gdelt.raw.map((a,i)=><div key={i}><a href={safeHref(a.url)} target="_blank" rel="noopener noreferrer" style={{fontFamily:M,fontSize:9,color:P.teal,textDecoration:"none"}}>{a.title||a.url} ↗</a>{i<osint.gdelt.raw.length-1&&<NeonDivider color={P.teal} mt={5} mb={5}/>}</div>)}</div>}
     </Sub>}
     {osint.openSources&&<Sub title={"Source Reputation  ·  "+(osint.openSources.flagged?"FLAGGED":"CLEAR")} color={osint.openSources.flagged?P.red:P.green} urgent={osint.openSources.flagged} audioRef={audioRef}>
       <p style={{fontFamily:M,fontSize:10,color:osint.openSources.flagged?P.red:P.green,margin:"6px 0 0",lineHeight:1.7}}>{osint.openSources.flagged?"Domain found in known unreliable source database.":"Domain not in known unreliable source lists."}</p>
@@ -622,7 +666,7 @@ function ContentGroup({r,audioRef}){
 function ContextGroup({r,audioRef}){
   const consU=r.consensus?.overallPattern==="fringe"?1:0,tempU=r.temporal?.riskLevel==="high"?1:0;
   const ls=(r.interestGroups?.labels)||[],vs=(r.interestGroups?.values)||[];
-  const topI=ls.map((l,i)=>({l,v:vs[i]||0})).sort((a,b)=>b.v-a.v).slice(0,4).filter(x=>x.v>10);
+  const topI=useMemo(()=>ls.map((l,i)=>({l,v:vs[i]||0})).sort((a,b)=>b.v-a.v).slice(0,4).filter(x=>x.v>10),[ls,vs]);
   const lmap2={source:"SRC",funding:"FND",author:"AUT",authorPay:"PAY",copyPaste:"ORI",study:"STD",academic:"ACA",factCheck:"FCK"};
   return <Group title="CONTEXT" color={P.blue} urgentCount={consU+tempU} audioRef={audioRef}>
     {r.consensus&&<Sub title="Consensus Map" color={P.blue} urgent={consU>0} audioRef={audioRef}>
@@ -686,11 +730,11 @@ function Results({r,osint,ci,social,audioRef,fromCache,cachedAt,onReanalyze}){
 function RepoDB({audioRef}){
   const [idx,setIdx]=useState(null),[sel,setSel]=useState(null),[hist,setHist]=useState([]);
   useEffect(()=>{loadIdx().then(setIdx);},[]);
-  async function select(d){audioRef.current.beep();setSel(d);setHist(await loadHist(d));}
+  const select=useCallback(async(d)=>{audioRef.current.beep();setSel(d);setHist(await loadHist(d));},[audioRef]);
   if(!idx)return <ACard><span style={{fontFamily:M,fontSize:9,color:P.dim}}>LOADING...</span></ACard>;
   const domains=Object.keys(idx).sort((a,b)=>(idx[a].s||0)-(idx[b].s||0));
   return <ACard title="REPUTATION DATABASE" color={P.purple}>
-    <div style={{fontFamily:M,fontSize:8,color:P.dim,marginBottom:10,lineHeight:1.8}}>Agent endpoint: <span style={{color:P.teal}}>window.__TRUTHILIZER_INDEX__</span><br/>Schema v2 · {domains.length} domains · bitmask flags · confidence intervals</div>
+    <div style={{fontFamily:M,fontSize:8,color:P.dim,marginBottom:10,lineHeight:1.8}}>Agent endpoint: <span style={{color:P.teal}}>window.__TRUTHILIZER_INDEX__</span><br/>Schema v2 · {domains.length} domains</div>
     {domains.length===0&&<div style={{fontFamily:M,fontSize:9,color:P.dim}}>No entries yet.</div>}
     {domains.map(d=>{const rec=idx[d],c=scoreColor(rec.s),recFlags=flagsToStrings(rec.f||0);return <div key={d} onClick={()=>select(d)} style={{display:"flex",alignItems:"center",gap:10,background:sel===d?P.alt:P.bg,borderRadius:3,padding:"8px 10px",marginBottom:5,cursor:"pointer",borderLeft:`2px solid ${c}`}}>
       <div style={{flex:1}}><div style={{fontFamily:M,fontSize:9,color:P.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{d}</div>{recFlags.length>0&&<div style={{marginTop:3}}>{recFlags.slice(0,2).map((f,i)=><Badge key={i} text={f} color={P.red}/>)}</div>}</div>
@@ -705,7 +749,6 @@ function RepoDB({audioRef}){
       {hist.map((h,i)=>{const c=scoreColor(h.s),hFlags=flagsToStrings(h.f||0);return <NeonCell key={i} color={c} pad="8px 10px" style={{marginBottom:5}}>
         <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:4}}>
           <span style={{fontFamily:M,fontSize:8,color:P.dim}}>{daysToDate(h.t)}</span>
-          {h.wa!=null&&<span style={{fontFamily:M,fontSize:8,color:P.dim}}>{"age:"+(h.wa/365).toFixed(1)+"y"}</span>}
           {h.gd!=null&&<span style={{fontFamily:M,fontSize:8,color:P.teal}}>{"gdelt:"+h.gd}</span>}
           {h.ci&&<span style={{fontFamily:M,fontSize:8,color:P.dim}}>{h.ci.lo+"-"+h.ci.hi}</span>}
           <span style={{fontFamily:M,fontSize:10,color:c,marginLeft:"auto"}}>{h.s}</span>
@@ -721,12 +764,12 @@ function RepoDB({audioRef}){
 
 // ── API ───────────────────────────────────────────────────────────────────────
 const SYS_SCHEMA='{"overallScore":<0-100>,"summary":"<2-3 sentences>","claims":[{"claim":"<verifiable claim>","score":<0-100>,"verdict":"<1 sentence>"}],"researchQueries":[{"query":"<plain english>","type":"SCHOLAR|PUBMED|NEWS|WIKI|GENERAL","source":"<n>","url":"<encoded url>"}],"consensus":{"highCred":<int>,"lowCred":<int>,"echoOnly":<0|1>,"overallPattern":"strong|mixed|fringe","summary":"<1-2 sentences>"},"headline":{"score":<0-100>,"match":"ACCURATE|MISLEADING|CLICKBAIT|UNVERIFIABLE","analysis":"<1-2 sentences>","flags":[]},"rhetoric":[{"type":"<fallacy>","severity":"high|medium|low","excerpt":"<quote>","explanation":"<1 sentence>"}],"missingContext":[{"type":"MISSING STAT SOURCE|MISSING SAMPLE SIZE|MISSING TIMEFRAME|SELECTIVE QUOTING|OTHER","description":"<1 sentence>"}],"temporal":{"published":"<date>","circulationPattern":"<desc>","riskLevel":"high|medium|low","summary":"<1-2 sentences>","corrections":[]},"ownership":{"chain":[{"name":"<entity>","note":"<brief>"}],"conflictOfInterest":"<desc or null>","summary":"<1 sentence>"},"similarArticles":[{"outlet":"<n>","headline":"<h>","credibility":"HIGH|MED|LOW","framingNote":"<diff>"}],"criteria":{"source":{"score":<int>,"summary":"<1 sentence>","flags":[]},"funding":{"score":<int>,"summary":"<1 sentence>","flags":[]},"author":{"score":<int>,"summary":"<1 sentence>","flags":[]},"authorPay":{"score":<int>,"summary":"<1 sentence>","flags":[]},"copyPaste":{"score":<int>,"summary":"<1 sentence>","flags":[]},"study":{"score":<int>,"summary":"<1 sentence>","flags":[]},"academic":{"score":<int>,"summary":"<1 sentence>","flags":[]},"factCheck":{"score":<int>,"summary":"<1 sentence>","flags":[]}},"interestGroups":{"labels":["Corp Media","Govt","NGO","Partisan","Academic","Foreign","Industry","Independent"],"values":[0,0,0,0,0,0,0,0]},"politicalLeanings":{"labels":["Far Left","Left","Ctr-Left","Center","Ctr-Right","Right","Far Right","Natl"],"values":[0,0,0,0,0,0,0,0]}}';
-const SYSTEM_PROMPT="You are a rigorous media literacy AI. Search the web to analyze this URL, then return ONLY valid JSON matching this schema — no markdown, no prose, no explanation:\n"+SYS_SCHEMA;
+const SYSTEM_PROMPT="You are a rigorous media literacy AI. Search the web to analyze this URL, then return ONLY valid JSON matching this schema — no markdown, no prose:\n"+SYS_SCHEMA;
 const AI_MSGS=["EXTRACTING CLAIMS...","TRACING OWNERSHIP...","SCANNING RHETORIC...","MAPPING CONSENSUS...","FOLLOWING MONEY...","CHECKING LOGIC...","MINING CONTEXT...","TEMPORAL ANALYSIS...","COMPUTING TRUTH MATRIX..."];
 
-async function callAPISingleShot(userMsg){
+async function callAPISingleShot(userMsg,signal){
   const body={model:"claude-sonnet-4-20250514",max_tokens:4000,system:SYSTEM_PROMPT,tools:[{type:"web_search_20250305",name:"web_search"}],messages:[{role:"user",content:userMsg}]};
-  const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const res=await fetch("/api/proxy",{method:"POST",signal,headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   if(!res.ok){const t=await res.text().catch(()=>"");throw new Error("HTTP "+res.status+(t?" — "+t.slice(0,120):""));}
   const data=await res.json();
   if(data.error)throw new Error(data.error.message||JSON.stringify(data.error));
@@ -754,20 +797,28 @@ export default function App(){
   const [flash,setFlash]=useState(false);
   const [repoCount,setRepoCount]=useState(0);
   const [clock,setClock]=useState("");
-  const ivRef=useRef(null),audioRef=useAudio(),scoreRef=useRef(null),busyRef=useRef(false);
+  // Single AbortController per scan — cancels all in-flight requests on new scan
+  const abortRef=useRef(null);
+  const ivRef=useRef(null),audioRef=useAudio(),scoreRef=useRef(null);
 
   useEffect(()=>{scoreRef.current=results?results.overallScore:null;},[results]);
-  useEffect(()=>{return()=>clearInterval(ivRef.current);},[]);
+  useEffect(()=>{return()=>{clearInterval(ivRef.current);abortRef.current?.abort();};},[]);
   useEffect(()=>{loadIdx().then(i=>setRepoCount(Object.keys(i).length));},[repoBust]);
   useEffect(()=>{const iv=setInterval(()=>setClock(new Date().toTimeString().slice(0,8)),1000);setClock(new Date().toTimeString().slice(0,8));return()=>clearInterval(iv);},[]);
 
   const runAnalysis=useCallback(async(urlStr,skipCache)=>{
-    if(!urlStr.trim()||busy||busyRef.current)return;
+    if(!urlStr.trim()||busy)return;
     if(!isValidUrl(urlStr.trim())){setErr("Invalid URL. Must start with http:// or https://");return;}
-    busyRef.current=true;
+
+    // Cancel any previous in-flight scan
+    abortRef.current?.abort();
+    const ac=new AbortController();
+    abortRef.current=ac;
+
     audioRef.current.beep();
     setBusy(true);setResults(null);setOsint(null);setCi(null);setSocial(null);setErr("");setFromCache(false);
     const urlIsSocial=isSocialUrl(urlStr.trim());setIsSocial(urlIsSocial);
+
     if(!skipCache){
       const cached=await getCached(urlStr.trim());
       if(cached?.results){
@@ -775,30 +826,35 @@ export default function App(){
         setFromCache(true);setCachedAt(cached.cachedAt);
         audioRef.current.chime(cached.results.overallScore);
         setFlash(true);setTimeout(()=>setFlash(false),400);
-        busyRef.current=false;setBusy(false);return;
+        setBusy(false);return;
       }
     }
     setMsg(AI_MSGS[0]);
     try{
       const [osintData,socialData]=await Promise.all([
-        runOSINT(urlStr.trim()),
-        urlIsSocial?analyzeSocialPost(urlStr.trim()):Promise.resolve(null)
+        runOSINT(urlStr.trim(),ac.signal),
+        urlIsSocial?analyzeSocialPost(urlStr.trim(),ac.signal):Promise.resolve(null)
       ]);
+      if(ac.signal.aborted)return;
       setOsint(osintData);if(socialData)setSocial(socialData);
+
       let mi=0;ivRef.current=setInterval(()=>{mi=(mi+1)%AI_MSGS.length;setMsg(AI_MSGS[mi]);},1900);
-      const ctx=["OSINT PRE-FLIGHT:",
-        "- Domain age: "+(osintData.whois?osintData.whois.ageYears+" years":"unknown"),
-        "- GDELT articles: "+(osintData.gdelt?osintData.gdelt.count:"no data"),
-        "- Bad actor list: "+(osintData.openSources?.flagged?"FLAGGED":"clear"),
-        "- Wayback: "+(osintData.wayback?.available?"First seen "+osintData.wayback.firstSeen:"No archive"),
-        "- Fact checks found: "+(osintData.factChecks?osintData.factChecks.length:0),
-        "- Retracted citations: "+(osintData.scholar?.some(p=>p.retracted)?"YES - CRITICAL":"none")
-      ].join("\n");
+
+      const ctx=["OSINT:",
+        "DOM_AGE:"+(osintData.whois?osintData.whois.ageYears+"y":"?"),
+        "GDELT:"+(osintData.gdelt?osintData.gdelt.count:"?"),
+        "BADLIST:"+(osintData.openSources?.flagged?"FLAG":"OK"),
+        "ARCHIVE:"+(osintData.wayback?.available?"Y":"N"),
+        "FCHK:"+(osintData.factChecks?osintData.factChecks.length:0),
+        "RETRACT:"+(osintData.scholar?.some(p=>p.retracted)?"YES":"NO")
+      ].join(" | ");
       const socialCtx=urlIsSocial&&socialData
-        ?"\nSOCIAL POST:\n- Type: "+(socialData.postType||"Unknown")+"\n- Opinion: "+(socialData.isOpinion?"YES":"NO")+"\n- Author cred: "+(socialData.authorCredibility||"?")+"/100\n- Claims: "+(socialData.claimsMade||[]).join("; ")
-        :"";
-      const uMsg="Analyze credibility of: "+urlStr.trim()+"\n"+ctx+socialCtx+"\nReturn ONLY the JSON object."+(urlIsSocial?" Note: social media post — distinguish opinion from fact clearly.":"");
-      const parsed=await callAPISingleShot(uMsg);
+        ?`\nSOCIAL: type=${socialData.postType} opinion=${socialData.isOpinion?"YES":"NO"} cred=${socialData.authorCredibility}/100 claims=${(socialData.claimsMade||[]).join("; ")}`:"";
+      const uMsg="Analyze credibility of: "+urlStr.trim()+"\n"+ctx+socialCtx+"\nReturn ONLY the JSON object."+(urlIsSocial?" Social post — distinguish opinion from fact clearly.":"");
+
+      const parsed=await callAPISingleShot(uMsg,ac.signal);
+      if(ac.signal.aborted)return;
+
       const ciData=computeConfidenceInterval(parsed.overallScore,osintData);
       clearInterval(ivRef.current);
       setResults(parsed);setCi(ciData);
@@ -808,16 +864,18 @@ export default function App(){
       await saveRep(parsed,urlStr.trim(),osintData,ciData);
       setRepoBust(k=>k+1);
     }catch(e){
+      if(ac.signal.aborted)return; // swallow abort errors silently
       clearInterval(ivRef.current);setErr(classifyError(e));
     }finally{
-      busyRef.current=false;setBusy(false);
+      if(!ac.signal.aborted)setBusy(false);
     }
   },[busy]);
 
   const analyze=useCallback(()=>runAnalysis(url,false),[url,runAnalysis]);
   const reanalyze=useCallback(()=>runAnalysis(url,true),[url,runAnalysis]);
-  function reset(){audioRef.current.beep();setResults(null);setOsint(null);setCi(null);setSocial(null);setIsSocial(false);setUrl("");setErr("");setFromCache(false);}
-  function onKey(e){if(e.key==="Enter")analyze();}
+  const reset=useCallback(()=>{audioRef.current.beep();abortRef.current?.abort();setResults(null);setOsint(null);setCi(null);setSocial(null);setIsSocial(false);setUrl("");setErr("");setFromCache(false);setBusy(false);},[audioRef]);
+  const onKey=useCallback((e)=>{if(e.key==="Enter")analyze();},[analyze]);
+  const handleUrlChange=useCallback((e)=>{setUrl(e.target.value);setErr("");},[]);
 
   return <div style={{background:P.bg,minHeight:"100vh",paddingBottom:32,fontFamily:M,position:"relative",zIndex:1}}>
     <style>{`@import url('${GFONT}');*{box-sizing:border-box}input::placeholder{color:${P.dim}}input:focus{outline:none;}::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:${P.bg}}::-webkit-scrollbar-thumb{background:${P.border};border-radius:2px}@keyframes vu{from{transform:scaleY(.3)}to{transform:scaleY(1)}}@keyframes blink{0%,100%{opacity:1}50%{opacity:.15}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}`}</style>
@@ -830,7 +888,7 @@ export default function App(){
       <div style={{padding:"10px 18px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
         <div>
           <div style={{fontFamily:M,fontSize:20,color:P.teal,letterSpacing:5}}>TRUTHILIZER</div>
-          <div style={{fontFamily:M,fontSize:8,color:P.dim,letterSpacing:2,marginTop:2}}>SIGNAL ANALYSIS TERMINAL v12.0</div>
+          <div style={{fontFamily:M,fontSize:8,color:P.dim,letterSpacing:2,marginTop:2}}>SIGNAL ANALYSIS TERMINAL v12.1</div>
         </div>
         <div style={{textAlign:"right"}}>
           <div style={{fontFamily:M,fontSize:11,color:P.amber}}>{clock}</div>
@@ -858,7 +916,7 @@ export default function App(){
         <MusicPanel audioRef={audioRef} score={results?results.overallScore:null}/>
         <ACard title="TARGET URL" color={busy?P.amber:results?scoreColor(results.overallScore):P.teal}>
           <div style={{display:"flex",gap:8}}>
-            <input value={url} onChange={e=>{setUrl(e.target.value);setErr("");}} onKeyDown={onKey} placeholder="PASTE URL TO ANALYZE..." style={{flex:1,fontFamily:M,fontSize:10,background:P.bg,color:P.teal,border:"none",padding:"10px 12px",borderRadius:3}}/>
+            <input value={url} onChange={handleUrlChange} onKeyDown={onKey} placeholder="PASTE URL TO ANALYZE..." style={{flex:1,fontFamily:M,fontSize:10,background:P.bg,color:P.teal,border:"none",padding:"10px 12px",borderRadius:3}}/>
             <LiveBorder color={busy?P.amber:P.teal} style={{borderRadius:3}}>
               <button onClick={analyze} disabled={busy||!url.trim()} style={{fontFamily:M,fontSize:9,background:busy?P.alt:P.tealD,color:busy?P.dim:P.teal,border:"none",padding:"10px 18px",cursor:busy?"default":"pointer",borderRadius:3,whiteSpace:"nowrap",letterSpacing:1}}>
                 <ScrambleText text={busy?"SCANNING...":"ANALYZE ▶"} active={busy}/>
